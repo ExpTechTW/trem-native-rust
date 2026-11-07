@@ -121,6 +121,17 @@ impl ProxyState {
     }
 
     pub fn new(cache_dir: &std::path::Path, config: ProxyConfig) -> Result<Self, String> {
+        Self::open(cache_dir, config, true)
+    }
+
+    /// For an app that asks none of ExpTech's regional services: the same proxy, but its
+    /// nodes are never probed, so it sends nothing but the app's own requests. A request
+    /// to a regional service still goes to that service's first node.
+    pub fn new_unrouted(cache_dir: &std::path::Path, config: ProxyConfig) -> Result<Self, String> {
+        Self::open(cache_dir, config, false)
+    }
+
+    fn open(cache_dir: &std::path::Path, config: ProxyConfig, probe: bool) -> Result<Self, String> {
         let cache = HttpCache::open(&cache_dir.join("http-cache.sqlite"))?;
 
         let client = reqwest::Client::builder()
@@ -132,7 +143,7 @@ impl ProxyState {
 
         let endpoints = Arc::new(Endpoints::new(client.clone()));
         // Fixture mode never touches the network, the node probes included.
-        if !crate::net::fixture::active() {
+        if probe && !crate::net::fixture::active() {
             endpoints.start();
         }
 
