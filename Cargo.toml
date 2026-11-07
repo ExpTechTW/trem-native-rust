@@ -1,0 +1,11 @@
+[workspace]
+members = ["trem-core", "trem-io", "trem-gfx"]
+resolver = "2"
+
+# What every crate says of itself.
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+publish = false
+repository = "https://github.com/ExpTechTW/trem-native-rust"
