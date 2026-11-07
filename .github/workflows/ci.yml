@@ -21,7 +21,7 @@ jobs:
       - uses: actions/checkout@v5
       - name: Install Linux packages
         run: sudo apt-get update && sudo apt-get install -y libspeechd-dev libdbus-1-dev libfontconfig1-dev clang
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.96.0
         with:
           components: rustfmt, clippy
           targets: wasm32-unknown-unknown
@@ -41,8 +41,10 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v5
+      # The fonts: the text tests check that characters missing from the embedded subset
+      # come from the system's fonts, and a bare runner has no CJK or math font.
       - name: Install Linux packages
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libspeechd-dev libdbus-1-dev libfontconfig1-dev clang
-      - uses: dtolnay/rust-toolchain@stable
+        run: sudo apt-get update && sudo apt-get install -y libspeechd-dev libdbus-1-dev libfontconfig1-dev clang fonts-noto-cjk fonts-noto-core
+      - uses: dtolnay/rust-toolchain@1.96.0
       - run: cargo test --workspace --all-features

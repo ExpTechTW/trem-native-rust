@@ -1,0 +1,6 @@
+# The toolchain the crates are developed and linted on. Newer clippy adds lints;
+# moving this is a change of its own, made with the code it asks for.
+[toolchain]
+channel = "1.96.0"
+components = ["rustfmt", "clippy"]
+targets = ["wasm32-unknown-unknown"]
