@@ -117,6 +117,13 @@ pub struct FontConfig {
     pub fallback: &'static str,
     /// The family [`FontFamily::Mono`] asks for, found as `sans` is; with none, mono
     /// text is shaped as sans.
+    ///
+    /// A list separated by commas, like a CSS stack ("SF Mono, Menlo"), is tried in
+    /// order: first among `faces`, then, the first time mono text is shaped, among the
+    /// system's fonts (scanned on their own thread, see [`prefetch_system_fonts`]), where
+    /// the name must be a family's whole name. Only the faces of the family found are
+    /// loaded. With none of them anywhere, mono text is shaped as sans with tabular
+    /// figures.
     pub mono: Option<&'static str>,
     /// Requested weights are clamped to these before shaping: the range the sans
     /// family's `wght` axis covers.
@@ -370,6 +377,11 @@ pub struct TextEngine {
     /// The sans and mono families as fontdb names them.
     sans: &'static str,
     mono: &'static str,
+    /// A mono stack with none of its names embedded: looked for among the system's
+    /// fonts the first time mono text is shaped.
+    mono_pending: Option<&'static str>,
+    /// No mono family anywhere: mono text is the sans with tabular figures.
+    mono_as_sans: bool,
     sans_ids: Vec<cosmic_text::fontdb::ID>,
     fallback_ids: Vec<cosmic_text::fontdb::ID>,
     weights: RangeInclusive<u16>,
@@ -400,7 +412,13 @@ impl TextEngine {
             |needle: &str| leak_str(find_family(&db, needle).unwrap_or_else(|| needle.to_string()));
         let sans = named(config.sans);
         let fallback = named(config.fallback);
-        let mono = config.mono.map_or(sans, named);
+        let (mono, mono_pending) = match config.mono {
+            None => (sans, None),
+            Some(stack) => match stack_names(stack).find_map(|name| find_family(&db, name)) {
+                Some(found) => (leak_str(found), None),
+                None => (sans, Some(stack)),
+            },
+        };
         log::info!("嵌入字型：{sans}、{fallback}");
         db.set_sans_serif_family(sans);
         let mut fonts = FontSystem::new_with_locale_and_db_and_fallback(
@@ -420,6 +438,8 @@ impl TextEngine {
             buffer,
             sans,
             mono,
+            mono_pending,
+            mono_as_sans: false,
             sans_ids,
             fallback_ids,
             weights: config.weights.clone(),
@@ -684,6 +704,9 @@ impl TextEngine {
         wrap: Wrap,
         width: Option<f32>,
     ) -> TextLayout {
+        if style.family == FontFamily::Mono && self.mono_pending.is_some() {
+            self.resolve_mono();
+        }
         let mut shaped = self.shape_once(text, style, wrap, width);
         let mut steps = 0;
         while shaped.missing && steps < 40 {
@@ -717,7 +740,7 @@ impl TextEngine {
             FontFamily::Sans => self.sans,
             FontFamily::Mono => self.mono,
         };
-        let tabular = style.tabular;
+        let tabular = style.tabular || (style.family == FontFamily::Mono && self.mono_as_sans);
         let weight = Weight(self.clamp_weight(style.weight));
         let spacing = if style.size > 0.0 {
             style.letter_spacing / style.size
@@ -775,6 +798,39 @@ impl TextEngine {
             },
             missing,
         }
+    }
+
+    /// The first name of the mono stack the system has, its faces added to the database;
+    /// else the sans, with tabular figures. Waits for the system scan if it is still
+    /// running.
+    fn resolve_mono(&mut self) {
+        let Some(stack) = self.mono_pending.take() else {
+            return;
+        };
+        let faces = system_faces();
+        for name in stack_names(stack) {
+            let mut found = faces
+                .iter()
+                .filter(|face| {
+                    face.families
+                        .iter()
+                        .any(|(family, _)| family.eq_ignore_ascii_case(name))
+                })
+                .peekable();
+            if found.peek().is_none() {
+                continue;
+            }
+            let db = self.fonts.db_mut();
+            for face in found {
+                db.push_face_info(face.clone());
+            }
+            self.mono = leak_str(name.to_string());
+            log::info!("等寬字型：{name}");
+            return;
+        }
+        self.mono = self.sans;
+        self.mono_as_sans = true;
+        log::info!("系統沒有等寬字型（{stack}）：改用 {} 加 tnum", self.sans);
     }
 
     fn load_one_fallback(&mut self) -> bool {
@@ -1139,6 +1195,14 @@ fn finite_width(width: f32) -> f32 {
 
 fn leak_str(text: String) -> &'static str {
     Box::leak(text.into_boxed_str())
+}
+
+/// The names of a stack separated by commas, as CSS writes `font-family`.
+fn stack_names(stack: &str) -> impl Iterator<Item = &str> {
+    stack
+        .split(',')
+        .map(|name| name.trim().trim_matches('"'))
+        .filter(|name| !name.is_empty())
 }
 
 fn find_family(db: &cosmic_text::fontdb::Database, needle: &str) -> Option<String> {
@@ -1695,6 +1759,50 @@ mod tests {
                 "{text}: {faces:?}"
             );
         }
+    }
+
+    /// A mono stack: the first of its names the system has, else the sans with tabular
+    /// figures, so columns of numbers still line up.
+    #[test]
+    fn a_mono_stack_comes_from_the_system_or_is_tabular_sans() {
+        let mono = |weight| TextStyle {
+            family: FontFamily::Mono,
+            ..style(weight)
+        };
+        let nowhere = FontConfig {
+            mono: Some("No Such Mono, \"Nor This One\""),
+            ..FONTS
+        };
+        let mut engine = TextEngine::new(&nowhere);
+        let ones = engine.measure("1111", &mono(400));
+        let eights = engine.measure("8888", &mono(400));
+        assert!(
+            (ones - eights).abs() < 0.05,
+            "1111 ({ones}) and 8888 ({eights})"
+        );
+        assert_eq!(engine.mono, engine.sans);
+        let sans = engine.measure("1111", &style(400));
+        assert!((sans - ones).abs() > 0.05, "plain sans is proportional");
+
+        // Menlo is on every Mac, DejaVu Sans Mono on most Linux desktops.
+        let system = FontConfig {
+            mono: Some("No Such Mono, Menlo, DejaVu Sans Mono"),
+            ..FONTS
+        };
+        let mut engine = TextEngine::new(&system);
+        let layout = engine.layout_single("0", &mono(400));
+        if engine.mono == engine.sans {
+            eprintln!("neither Menlo nor DejaVu Sans Mono here: nothing to check");
+            return;
+        }
+        let faces = fingerprint(&engine, &layout);
+        assert!(
+            faces[0].0.starts_with("Menlo") || faces[0].0.starts_with("DejaVuSansMono"),
+            "{faces:?}"
+        );
+        // Sans text is not touched by it.
+        let latin = engine.layout_single("A", &style(400));
+        assert!(engine.sans_ids.contains(&latin.lines[0].glyphs[0].font_id));
     }
 
     #[test]
