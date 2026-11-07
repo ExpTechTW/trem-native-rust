@@ -22,6 +22,9 @@ pub enum Instance {
 }
 
 /// Ask for the lock, or tell the running app to show itself.
+///
+/// Sends nothing beyond the hello. [`claim_instance_sending`] is the same handshake
+/// with the launching process's arguments after it.
 pub fn claim_instance(config: &InstanceConfig) -> Option<Instance> {
     let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, config.port));
     match TcpListener::bind(addr) {
@@ -41,6 +44,9 @@ pub fn claim_instance(config: &InstanceConfig) -> Option<Instance> {
 }
 
 /// A second launch knocks here; `second` is called each time, on the listener's thread.
+///
+/// The bytes after the hello are not read, so this behaves as it always has whether or
+/// not the other side sends arguments. [`serve_instance_with_args`] reads them.
 pub fn serve_instance(
     config: &InstanceConfig,
     listener: TcpListener,
@@ -114,6 +120,170 @@ fn spawn_server(
                     let _ = stream.write_all(hello);
                     second();
                 }
+            }
+        })
+        .map_err(|err| log::warn!(target: "app", "單一執行個體的監聽起不來：{err}"))
+        .ok()
+}
+
+/// [`claim_instance`] that also hands `args` to the running app.
+///
+/// The running app receives them only from [`serve_instance_with_args`]. One that used
+/// [`serve_instance`] still only hears that a second launch happened; these bytes sit
+/// unread and the hello exchange is the one [`claim_instance`] does. Binding the port
+/// still means this process is first, and `args` are not sent anywhere.
+pub fn claim_instance_sending(config: &InstanceConfig, args: &[String]) -> Option<Instance> {
+    let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, config.port));
+    match TcpListener::bind(addr) {
+        Ok(listener) => Some(Instance::First(listener)),
+        Err(_) => {
+            let Ok(mut stream) = TcpStream::connect_timeout(&addr, Duration::from_millis(500))
+            else {
+                return None;
+            };
+            let _ = stream.set_nodelay(true);
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+            let _ = stream.set_write_timeout(Some(Duration::from_millis(500)));
+            if stream.write_all(config.hello).is_err() {
+                return None;
+            }
+            // The frame follows the hello before the reply is read, so a server that
+            // answers and then reads is not waiting on a write that has not happened.
+            if let Err(err) = write_arg_frame(&mut stream, args) {
+                log::warn!(target: "app", "第二個實例的參數送不出去：{err}");
+            }
+            let mut answer = vec![0; config.hello.len()];
+            let confirmed = stream.read_exact(&mut answer).is_ok() && answer == config.hello;
+            confirmed.then_some(Instance::Second)
+        }
+    }
+}
+
+/// [`serve_instance_releasable`] that also receives what [`claim_instance_sending`] sent.
+///
+/// `on_args` runs on the listener's thread. A peer that sends no frame
+/// ([`claim_instance`]) arrives as an empty list, and so does a frame that cannot be
+/// read; the launch still happened. Dropping the server, or [`InstanceServer::release`],
+/// frees the port at once, as [`serve_instance_releasable`] does.
+pub fn serve_instance_with_args(
+    config: &InstanceConfig,
+    listener: TcpListener,
+    on_args: impl Fn(Vec<String>) + Send + 'static,
+) -> InstanceServer {
+    let port = listener
+        .local_addr()
+        .map(|addr| addr.port())
+        .unwrap_or(config.port);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = spawn_server_with_args(config.hello, listener, Arc::clone(&stop), on_args);
+    InstanceServer { port, stop, thread }
+}
+
+/// After the hello, both ways: a `u32` little-endian count, then each argument as a
+/// `u32` little-endian byte length and its UTF-8. Count and length stay within these,
+/// so a peer on the port cannot make the listener allocate without bound.
+const MAX_FORWARDED_ARGS: u32 = 64;
+const MAX_FORWARDED_ARG_LEN: u32 = 8 * 1024;
+
+fn write_arg_frame(stream: &mut TcpStream, args: &[String]) -> std::io::Result<()> {
+    let count = u32::try_from(args.len()).map_err(invalid_frame)?;
+    if count > MAX_FORWARDED_ARGS {
+        return Err(invalid_frame("參數太多"));
+    }
+    stream.write_all(&count.to_le_bytes())?;
+    for arg in args {
+        let len = u32::try_from(arg.len()).map_err(invalid_frame)?;
+        if len > MAX_FORWARDED_ARG_LEN {
+            return Err(invalid_frame("參數太長"));
+        }
+        stream.write_all(&len.to_le_bytes())?;
+        stream.write_all(arg.as_bytes())?;
+    }
+    Ok(())
+}
+
+fn invalid_frame(err: impl std::fmt::Display) -> std::io::Error {
+    std::io::Error::new(std::io::ErrorKind::InvalidInput, err.to_string())
+}
+
+/// `None`: the peer closed or never sent a frame (the plain [`claim_instance`]).
+/// `Some(Err)`: a frame arrived and was not usable.
+fn read_arg_frame(stream: &mut TcpStream) -> Option<Result<Vec<String>, String>> {
+    let mut buf = [0u8; 4];
+    if let Err(err) = stream.read_exact(&mut buf) {
+        return no_frame(err);
+    }
+    let count = u32::from_le_bytes(buf);
+    if count > MAX_FORWARDED_ARGS {
+        return Some(Err(format!("參數太多：{count}")));
+    }
+    let mut args = Vec::new();
+    for _ in 0..count {
+        if let Err(err) = stream.read_exact(&mut buf) {
+            return Some(Err(err.to_string()));
+        }
+        let len = u32::from_le_bytes(buf);
+        if len > MAX_FORWARDED_ARG_LEN {
+            return Some(Err(format!("參數太長：{len}")));
+        }
+        let Ok(len) = usize::try_from(len) else {
+            return Some(Err(format!("參數太長：{len}")));
+        };
+        let mut bytes = vec![0u8; len];
+        if let Err(err) = stream.read_exact(&mut bytes) {
+            return Some(Err(err.to_string()));
+        }
+        match String::from_utf8(bytes) {
+            Ok(text) => args.push(text),
+            Err(err) => return Some(Err(err.to_string())),
+        }
+    }
+    Some(Ok(args))
+}
+
+/// A missing frame is the old handshake, not a failure. Anything else is.
+fn no_frame(err: std::io::Error) -> Option<Result<Vec<String>, String>> {
+    match err.kind() {
+        std::io::ErrorKind::UnexpectedEof
+        | std::io::ErrorKind::TimedOut
+        | std::io::ErrorKind::WouldBlock
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted => None,
+        _ => Some(Err(err.to_string())),
+    }
+}
+
+fn spawn_server_with_args(
+    hello: &'static [u8],
+    listener: TcpListener,
+    stop: Arc<AtomicBool>,
+    on_args: impl Fn(Vec<String>) + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
+    std::thread::Builder::new()
+        .name("single-instance".into())
+        .spawn(move || {
+            for stream in listener.incoming().flatten() {
+                if stop.load(Ordering::SeqCst) {
+                    break;
+                }
+                let mut stream = stream;
+                let _ = stream.set_nodelay(true);
+                let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
+                let mut knock = vec![0; hello.len()];
+                if stream.read_exact(&mut knock).is_err() || knock != hello {
+                    continue;
+                }
+                let _ = stream.write_all(hello);
+                let args = match read_arg_frame(&mut stream) {
+                    Some(Ok(args)) => args,
+                    // The plain `claim_instance` sends no frame and then closes.
+                    None => Vec::new(),
+                    Some(Err(err)) => {
+                        log::warn!(target: "app", "第二個實例的參數讀不到：{err}");
+                        Vec::new()
+                    }
+                };
+                on_args(args);
             }
         })
         .map_err(|err| log::warn!(target: "app", "單一執行個體的監聽起不來：{err}"))
@@ -362,5 +532,91 @@ mod tests {
         // The port is free: the next launch is the first, and nobody was told.
         assert!(matches!(claim_instance(&ours), Some(Instance::First(_))));
         assert!(heard.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_second_launch_hands_its_arguments_across() {
+        let port = free_port();
+        let ours = InstanceConfig {
+            port,
+            hello: b"trem-gfx-args",
+        };
+        let Some(Instance::First(listener)) = claim_instance(&ours) else {
+            panic!("the first launch takes the lock");
+        };
+        let (sent, got) = std::sync::mpsc::channel();
+        let server = serve_instance_with_args(&ours, listener, move |args| {
+            let _ = sent.send(args);
+        });
+        let args = vec![
+            "trem-monitor://oauth/callback?code=1&state=a%20b".to_string(),
+            "--restarted".to_string(),
+        ];
+        assert!(matches!(
+            claim_instance_sending(&ours, &args),
+            Some(Instance::Second)
+        ));
+        assert_eq!(
+            got.recv_timeout(Duration::from_secs(2))
+                .expect("the arguments arrive"),
+            args
+        );
+        // An explicit empty list is a frame of count zero, not a missing frame.
+        assert!(matches!(
+            claim_instance_sending(&ours, &[]),
+            Some(Instance::Second)
+        ));
+        assert_eq!(
+            got.recv_timeout(Duration::from_secs(2))
+                .expect("an empty argument list"),
+            Vec::<String>::new()
+        );
+        // No frame at all: the plain claim, which must still be heard.
+        assert!(matches!(claim_instance(&ours), Some(Instance::Second)));
+        assert_eq!(
+            got.recv_timeout(Duration::from_secs(2))
+                .expect("a launch with no arguments"),
+            Vec::<String>::new()
+        );
+        // Not our hello: nothing is delivered.
+        let theirs = InstanceConfig {
+            port,
+            hello: b"someone-else!",
+        };
+        assert!(claim_instance_sending(&theirs, &args).is_none());
+        assert!(got.try_recv().is_err());
+        server.release();
+    }
+
+    #[test]
+    fn arguments_do_not_change_the_old_handshake() {
+        let port = free_port();
+        let ours = InstanceConfig {
+            port,
+            hello: b"trem-gfx-old",
+        };
+        let Some(Instance::First(listener)) = claim_instance(&ours) else {
+            panic!("the first launch takes the lock");
+        };
+        let (knocked, heard) = std::sync::mpsc::channel();
+        serve_instance(&ours, listener, move || {
+            let _ = knocked.send(());
+        });
+        let args = vec!["trem-monitor://oauth/callback?code=1".to_string()];
+        assert!(matches!(
+            claim_instance_sending(&ours, &args),
+            Some(Instance::Second)
+        ));
+        heard
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the first launch is told");
+        assert!(heard.try_recv().is_err());
+    }
+
+    fn free_port() -> u16 {
+        TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|listener| listener.local_addr())
+            .expect("a free port")
+            .port()
     }
 }
