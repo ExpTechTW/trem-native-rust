@@ -58,9 +58,26 @@ pub struct QuadDesc {
     pub clip: ClipPx,
 }
 
+/// A straight stroke, SVG's `<line>`, in physical pixels.
+#[derive(Clone, Copy, Debug)]
+pub struct LineDesc {
+    pub from: [f32; 2],
+    pub to: [f32; 2],
+    pub width: f32,
+    pub color: [f32; 4],
+    /// `stroke-dasharray`'s dash and gap; a zero dash or gap is a solid line.
+    pub dash: [f32; 2],
+    /// How far into the dash pattern `from` is.
+    pub phase: f32,
+    /// Round caps, else butt.
+    pub round: bool,
+    pub clip: ClipPx,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum BatchKind {
     Rect,
+    Line,
     Text,
     Image(u32),
 }
@@ -84,6 +101,7 @@ pub struct UiPass {
     group1_layout: wgpu::BindGroupLayout,
     sampler: wgpu::Sampler,
     rect_pipeline: wgpu::RenderPipeline,
+    line_pipeline: wgpu::RenderPipeline,
     text_pipeline: wgpu::RenderPipeline,
     image_pipeline: wgpu::RenderPipeline,
     uniform: wgpu::Buffer,
@@ -174,9 +192,17 @@ impl UiPass {
             min_filter: wgpu::FilterMode::Linear,
             ..Default::default()
         });
-        let rect_pipeline = pipeline(gpu, &shader, &rect_layout, format, "fs_rect");
-        let text_pipeline = pipeline(gpu, &shader, &textured_layout, format, "fs_text");
-        let image_pipeline = pipeline(gpu, &shader, &textured_layout, format, "fs_image");
+        let rect_pipeline = pipeline(gpu, &shader, &rect_layout, format, "vs_main", "fs_rect");
+        let line_pipeline = pipeline(gpu, &shader, &rect_layout, format, "vs_line", "fs_line");
+        let text_pipeline = pipeline(gpu, &shader, &textured_layout, format, "vs_main", "fs_text");
+        let image_pipeline = pipeline(
+            gpu,
+            &shader,
+            &textured_layout,
+            format,
+            "vs_main",
+            "fs_image",
+        );
         // A browser cannot wait here: its answer arrives later, and is logged.
         #[cfg(target_arch = "wasm32")]
         {
@@ -207,6 +233,7 @@ impl UiPass {
             group1_layout,
             sampler,
             rect_pipeline,
+            line_pipeline,
             text_pipeline,
             image_pipeline,
             uniform,
@@ -250,6 +277,43 @@ impl UiPass {
                 shadow: [desc.shadow[0], desc.shadow[1], desc.shadow[2], shadow_a],
                 params: [desc.border_w, desc.angle, desc.blur, desc.spread],
                 shadow_off: [desc.shadow_off[0], desc.shadow_off[1], 0.0, 0.0],
+                clip: desc.clip.aabb,
+                round_box: desc.clip.round_box,
+                round_radii: desc.clip.round_radii,
+                uv: [0.0; 4],
+                tint: [1.0; 4],
+            },
+        );
+    }
+
+    /// A line. Nothing for one of no width, no colour or no finite ends.
+    pub fn line(&mut self, desc: &LineDesc) {
+        let ends = [desc.from[0], desc.from[1], desc.to[0], desc.to[1]];
+        if desc.width.is_nan()
+            || desc.width <= 0.0
+            || desc.color[3].is_nan()
+            || desc.color[3] <= 0.0
+            || ends.iter().any(|v| !v.is_finite())
+        {
+            return;
+        }
+        let dash = if desc.dash[0] > 0.0 && desc.dash[1] > 0.0 {
+            desc.dash
+        } else {
+            [0.0; 2]
+        };
+        self.push(
+            BatchKind::Line,
+            Instance {
+                rect: ends,
+                quad: ends,
+                radii: [if desc.round { 1.0 } else { 0.0 }, 0.0, 0.0, 0.0],
+                color0: desc.color,
+                color1: desc.color,
+                border: [0.0; 4],
+                shadow: [0.0; 4],
+                params: [desc.width, dash[0], dash[1], desc.phase],
+                shadow_off: [0.0; 4],
                 clip: desc.clip.aabb,
                 round_box: desc.clip.round_box,
                 round_radii: desc.clip.round_radii,
@@ -377,6 +441,10 @@ impl UiPass {
             match batch.kind {
                 BatchKind::Rect => {
                     pass.set_pipeline(&self.rect_pipeline);
+                    pass.set_bind_group(0, &self.group0, &[]);
+                }
+                BatchKind::Line => {
+                    pass.set_pipeline(&self.line_pipeline);
                     pass.set_bind_group(0, &self.group0, &[]);
                 }
                 BatchKind::Text => {
@@ -514,6 +582,7 @@ fn pipeline(
     shader: &wgpu::ShaderModule,
     layout: &wgpu::PipelineLayout,
     format: wgpu::TextureFormat,
+    vertex: &str,
     fragment: &str,
 ) -> wgpu::RenderPipeline {
     gpu.device
@@ -522,7 +591,7 @@ fn pipeline(
             layout: Some(layout),
             vertex: wgpu::VertexState {
                 module: shader,
-                entry_point: Some("vs_main"),
+                entry_point: Some(vertex),
                 compilation_options: wgpu::PipelineCompilationOptions::default(),
                 buffers: &[],
             },

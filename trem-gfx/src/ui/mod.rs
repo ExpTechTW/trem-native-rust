@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::render::{
-    append_glyph_quads, ClipPx, FontConfig, FontMetrics, GlyphDraw, GlyphQuad, HAlign, QuadDesc,
-    TextEngine, TextStyle, UiPass, VAlign,
+    append_glyph_quads, ClipPx, FontConfig, FontMetrics, GlyphDraw, GlyphQuad, HAlign, LineDesc,
+    QuadDesc, TextEngine, TextStyle, UiPass, VAlign,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -156,6 +156,46 @@ impl QuadStyle {
     }
 }
 
+/// SVG's `stroke-linecap`.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum LineCap {
+    #[default]
+    Butt,
+    Round,
+}
+
+/// A line's stroke, as SVG's `stroke`, `stroke-width`, `stroke-dasharray` (two values)
+/// and `stroke-linecap` give it. Logical pixels.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct LineStyle {
+    pub color: Color,
+    pub width: f32,
+    /// Dash and gap; None is a solid line.
+    pub dash: Option<(f32, f32)>,
+    pub cap: LineCap,
+}
+
+impl LineStyle {
+    pub fn solid(color: Color, width: f32) -> Self {
+        Self {
+            color,
+            width,
+            dash: None,
+            cap: LineCap::Butt,
+        }
+    }
+
+    pub fn dashed(mut self, dash: f32, gap: f32) -> Self {
+        self.dash = Some((dash, gap));
+        self
+    }
+
+    pub fn cap(mut self, cap: LineCap) -> Self {
+        self.cap = cap;
+        self
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub struct WidgetId(pub u64);
 
@@ -248,6 +288,14 @@ enum DrawOp {
         style: QuadStyle,
         clip: ClipSnapshot,
     },
+    Line {
+        from: (f32, f32),
+        to: (f32, f32),
+        style: LineStyle,
+        /// How far into the dash pattern `from` is.
+        phase: f32,
+        clip: ClipSnapshot,
+    },
     Image {
         id: ImageId,
         rect: Rect,
@@ -270,6 +318,7 @@ enum DrawOp {
 #[derive(Clone, Copy)]
 enum Cmd {
     Quad(QuadDesc),
+    Line(LineDesc),
     Image {
         id: u32,
         dest: [f32; 4],
@@ -510,6 +559,36 @@ impl Ui {
         });
     }
 
+    /// A straight line from `from` to `to`: an SVG `<line>`.
+    pub fn line(&mut self, from: (f32, f32), to: (f32, f32), style: &LineStyle) {
+        let clip = self.snapshot();
+        self.ops.push(DrawOp::Line {
+            from,
+            to,
+            style: *style,
+            phase: 0.0,
+            clip,
+        });
+    }
+
+    /// Lines through `points`, an SVG `<polyline>`: the dashes run on from one segment to
+    /// the next. The joins are the caps' (round caps make round joins).
+    pub fn polyline(&mut self, points: &[(f32, f32)], style: &LineStyle) {
+        let clip = self.snapshot();
+        let mut phase = 0.0;
+        for pair in points.windows(2) {
+            let (from, to) = (pair[0], pair[1]);
+            self.ops.push(DrawOp::Line {
+                from,
+                to,
+                style: *style,
+                phase,
+                clip,
+            });
+            phase += (to.0 - from.0).hypot(to.1 - from.1);
+        }
+    }
+
     pub fn image(&mut self, id: ImageId, rect: Rect, tint: Color) {
         let clip = self.snapshot();
         self.ops.push(DrawOp::Image {
@@ -670,6 +749,7 @@ impl Ui {
             let cmd = self.cmds[index];
             match cmd {
                 Cmd::Quad(desc) => self.pass.quad(&desc),
+                Cmd::Line(desc) => self.pass.line(&desc),
                 Cmd::Image {
                     id,
                     dest,
@@ -707,6 +787,19 @@ impl Ui {
             DrawOp::Quad { rect, style, clip } => Extract::Quad {
                 rect: *rect,
                 style: *style,
+                clip: *clip,
+            },
+            DrawOp::Line {
+                from,
+                to,
+                style,
+                phase,
+                clip,
+            } => Extract::Line {
+                from: *from,
+                to: *to,
+                style: *style,
+                phase: *phase,
                 clip: *clip,
             },
             DrawOp::Image {
@@ -775,6 +868,25 @@ impl Ui {
                     clip: clip.to_px(scale, screen),
                 }));
             }
+            Extract::Line {
+                from,
+                to,
+                style,
+                phase,
+                clip,
+            } => {
+                let (dash, gap) = style.dash.unwrap_or((0.0, 0.0));
+                self.cmds.push(Cmd::Line(LineDesc {
+                    from: [from.0 * scale, from.1 * scale],
+                    to: [to.0 * scale, to.1 * scale],
+                    width: style.width * scale,
+                    color: style.color.to_array(),
+                    dash: [dash * scale, gap * scale],
+                    phase: phase * scale,
+                    round: style.cap == LineCap::Round,
+                    clip: clip.to_px(scale, screen),
+                }));
+            }
             Extract::Image {
                 id,
                 rect,
@@ -829,6 +941,13 @@ enum Extract {
     Quad {
         rect: Rect,
         style: QuadStyle,
+        clip: ClipSnapshot,
+    },
+    Line {
+        from: (f32, f32),
+        to: (f32, f32),
+        style: LineStyle,
+        phase: f32,
         clip: ClipSnapshot,
     },
     Image {
@@ -928,5 +1047,71 @@ mod tests {
         stack.push(Rect::new(0.0, 0.0, 10.0, 10.0), [0.0; 4]);
         stack.push(Rect::new(20.0, 20.0, 5.0, 5.0), [0.0; 4]);
         assert_eq!(stack.aabb(), Some(Rect::ZERO));
+    }
+
+    /// A pixel-centred line covers its row whole and stops at its ends (butt caps); its
+    /// dashes and gaps fall where `stroke-dasharray` puts them, running on round a
+    /// polyline's corner; a clip cuts it.
+    #[cfg(all(feature = "testing", not(target_arch = "wasm32")))]
+    #[test]
+    fn lines_are_solid_dashed_and_clipped() {
+        let Some(gpu) = crate::testing::gpu() else {
+            return;
+        };
+        const FONTS: FontConfig = FontConfig {
+            faces: &[include_bytes!("../../testdata/fonts/Manrope.ttf")],
+            sans: "Manrope",
+            fallback: "Manrope",
+            mono: None,
+            weights: 200..=800,
+            metrics: FontMetrics {
+                ascent: 1.066,
+                descent: 0.3,
+                normal_ascent: 1.066,
+                normal_line: 1.366,
+                line_height: 1.35,
+            },
+            locale: "en",
+        };
+        let (w, h) = (40u32, 24u32);
+        let format = crate::render::OFFSCREEN_FORMAT;
+        let mut ui = Ui::new(&gpu, format, (w as f32, h as f32), 1.0, &FONTS).expect("a UI");
+        let white = Color::rgba_u8(255, 255, 255, 255);
+        let rgba = crate::render::render_rgba(&gpu, w, h, |view, encoder| {
+            ui.begin();
+            ui.line((2.0, 2.5), (38.0, 2.5), &LineStyle::solid(white, 1.0));
+            ui.line(
+                (2.0, 6.5),
+                (38.0, 6.5),
+                &LineStyle::solid(white, 1.0).dashed(3.0, 3.0),
+            );
+            // Down 4.5, then across: the second segment starts 1.5 into the gap.
+            ui.polyline(
+                &[(2.5, 10.0), (2.5, 14.5), (38.0, 14.5)],
+                &LineStyle::solid(white, 1.0).dashed(3.0, 2.0),
+            );
+            ui.push_clip(Rect::new(0.0, 0.0, 20.0, h as f32));
+            ui.line((2.0, 20.5), (38.0, 20.5), &LineStyle::solid(white, 1.0));
+            ui.pop_clip();
+            ui.end();
+            ui.render(&gpu, view, encoder, Some(wgpu::Color::BLACK));
+        })
+        .expect("a frame");
+        let red = |x: u32, y: u32| rgba[((y * w + x) * 4) as usize];
+        let lit = |x, y| red(x, y) > 200;
+        let dark = |x, y| red(x, y) < 40;
+        // Solid: the row from its start to its end, nothing either side.
+        assert!((2..38).all(|x| lit(x, 2)));
+        assert!(dark(1, 2) && dark(38, 2) && dark(20, 1) && dark(20, 3));
+        // Dashed 3 3 from x = 2: on 2–4, off 5–7, on 8–10.
+        assert!([2, 3, 4, 8, 9, 10].iter().all(|x| lit(*x, 6)));
+        assert!([5, 6, 7, 11, 12, 13].iter().all(|x| dark(*x, 6)));
+        // Dashed 3 2 round the corner: down, a dash to 3 and a gap after; across, the
+        // gap's last half pixel, a dash from x 3 to 6, a gap to 8, a dash again.
+        assert!(lit(2, 11) && dark(2, 13));
+        assert!(dark(2, 14) && lit(3, 14) && lit(5, 14) && dark(6, 14) && dark(7, 14));
+        assert!(lit(8, 14));
+        // The clip keeps the left half.
+        assert!(lit(10, 20) && dark(25, 20));
     }
 }

@@ -178,6 +178,69 @@ fn fs_rect(in: VsOut) -> @location(0) vec4f {
     return vec4f(acc.rgb * clip_cov, acc.a * clip_cov);
 }
 
+// Lines, SVG's `<line>` stroke. For a line the instance's `rect` holds its two ends
+// (x0, y0, x1, y1), `params` the width, the dash, the gap and how far into the dash
+// pattern the first end is, `radii.x` 1 for round caps, `color0` the colour; all in
+// physical pixels. The quad is the segment's own box, turned along it.
+@vertex
+fn vs_line(@builtin(vertex_index) vi: u32, @builtin(instance_index) ii: u32) -> VsOut {
+    var corner = vec2f(0.0, 0.0);
+    if vi == 1u || vi == 4u || vi == 5u {
+        corner.x = 1.0;
+    }
+    if vi == 2u || vi == 3u || vi == 5u {
+        corner.y = 1.0;
+    }
+    let ends = instances[ii].rect;
+    let d = ends.zw - ends.xy;
+    let len = length(d);
+    let dir = select(vec2f(1.0, 0.0), d / max(len, 0.0001), len > 0.0001);
+    let normal = vec2f(-dir.y, dir.x);
+    // Half the width, and a pixel for the edge's coverage.
+    let pad = instances[ii].params.x * 0.5 + 1.0;
+    let along = mix(-pad, len + pad, corner.x);
+    let across = mix(-pad, pad, corner.y);
+    let px = ends.xy + dir * along + normal * across;
+    var out: VsOut;
+    out.pos = vec4f(
+        px.x / globals.screen.x * 2.0 - 1.0,
+        1.0 - px.y / globals.screen.y * 2.0,
+        0.0,
+        1.0,
+    );
+    out.uv = vec2f(along, across);
+    out.index = ii;
+    return out;
+}
+
+@fragment
+fn fs_line(in: VsOut) -> @location(0) vec4f {
+    let ends = instances[in.index].rect;
+    let params = instances[in.index].params;
+    let len = length(ends.zw - ends.xy);
+    let along = in.uv.x;
+    let across = abs(in.uv.y);
+    let half = params.x * 0.5;
+    // Distance to the stroke's edge, in pixels: a box (butt caps) or a capsule (round).
+    let beyond = max(-along, along - len);
+    let butt = max(beyond, across - half);
+    let round = length(vec2f(max(beyond, 0.0), across)) - half;
+    let sd = select(butt, round, instances[in.index].radii.x > 0.5);
+    // A pixel's coverage of the edge, as a browser rasterizes a path.
+    var cov = clamp(0.5 - sd, 0.0, 1.0);
+    // `stroke-dasharray: dash gap`: distance to the nearest dash along the line.
+    let dash = params.y;
+    let period = dash + params.z;
+    if dash > 0.0 && params.z > 0.0 {
+        let t = (along + params.w) - floor((along + params.w) / period) * period;
+        let to_dash = min(max(-t, t - dash), period - t);
+        cov = cov * clamp(0.5 - to_dash, 0.0, 1.0);
+    }
+    let color = instances[in.index].color0;
+    let a = color.a * cov * clip_coverage(in.pos.xy, in.index);
+    return vec4f(color.rgb * a, a);
+}
+
 @fragment
 fn fs_text(in: VsOut) -> @location(0) vec4f {
     let tint = instances[in.index].tint;

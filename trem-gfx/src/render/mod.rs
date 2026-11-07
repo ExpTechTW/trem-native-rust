@@ -20,4 +20,4 @@ pub use text::{
     append_glyph_quads, FontConfig, FontFamily, FontMetrics, GlyphDraw, GlyphQuad, HAlign,
     TextEngine, TextLayout, TextStyle, VAlign,
 };
-pub use ui_pass::{ClipPx, QuadDesc, UiPass};
+pub use ui_pass::{ClipPx, LineDesc, QuadDesc, UiPass};
