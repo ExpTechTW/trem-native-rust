@@ -127,6 +127,50 @@ fn fs_line(in: LineOut) -> @location(0) vec4f {
     return in.color * d.opacity * alpha;
 }
 
+// ---- Chosen towns' outlines -------------------------------------------------
+// The tile's lines with each vertex's town code beside them: only the towns marked in
+// the lookup's second square are drawn.
+
+struct CodedLineOut {
+    @builtin(position) pos: vec4f,
+    @location(0) tile: vec2f,
+    @location(1) across: f32,
+    @location(2) outset: f32,
+    @location(3) color: vec4f,
+    @location(4) @interpolate(flat) code: u32,
+};
+
+@vertex
+fn vs_line_tile_coded(
+    @location(0) p: vec2<i32>,
+    @location(1) n: vec4<i32>,
+    @location(2) code: u32,
+) -> CodedLineOut {
+    let tile = vec2f(p);
+    let line = line_out(d.origin + tile * d.scale, n, tile, d.color);
+    var out: CodedLineOut;
+    out.pos = line.pos;
+    out.tile = line.tile;
+    out.across = line.across;
+    out.outset = line.outset;
+    out.color = line.color;
+    out.code = code;
+    return out;
+}
+
+@fragment
+fn fs_line_coded(in: CodedLineOut) -> @location(0) vec4f {
+    if (!inside_tile(in.tile) || in.code == 0u || in.code >= 1024u) {
+        discard;
+    }
+    let chosen = textureLoad(lookup, vec2<i32>(i32(in.code % 32u), 32 + i32(in.code / 32u)), 0);
+    if (chosen.a <= 0.0) {
+        discard;
+    }
+    let alpha = clamp(in.outset - abs(in.across), 0.0, 1.0);
+    return in.color * d.opacity * alpha;
+}
+
 // ---- Hillshade --------------------------------------------------------------
 
 struct ShadeOut {

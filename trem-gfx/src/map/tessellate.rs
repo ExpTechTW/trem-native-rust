@@ -51,6 +51,10 @@ pub struct TileMesh {
     pub line_indices: Vec<u32>,
     pub town_line: Span,
     pub city_line: Span,
+    /// Each line vertex's town code, 0 off the town outlines: what picks out chosen
+    /// towns' outlines. Kept beside the vertices so their layout stays as it was; only
+    /// uploaded when asked for ([`super::tiles::TileManager::keep_line_codes`]).
+    pub line_codes: Vec<u32>,
 }
 
 impl TileMesh {
@@ -114,6 +118,7 @@ fn append(mesh: &mut TileMesh, part: TileMesh) {
     mesh.line_vertices.extend(part.line_vertices);
     mesh.line_indices
         .extend(part.line_indices.into_iter().map(|i| i + line_base));
+    mesh.line_codes.extend(part.line_codes);
 }
 
 /// Cut every feature of a layer on the workers, then put them together in order: the
@@ -317,7 +322,7 @@ fn join(before: Option<(f32, f32)>, after: (f32, f32)) -> ((f32, f32), bool) {
     ((unit.0 * miter, unit.1 * miter), false)
 }
 
-fn line_layer(layer: &mvt::Layer, extent: i16, mesh: &mut TileMesh) -> Span {
+fn line_layer(layer: &mvt::Layer, extent: i16, mesh: &mut TileMesh, use_code: bool) -> Span {
     let start = mesh.line_indices.len() as u32;
     // An edge that runs along the tile's own boundary is where the polygon was cut,
     // not where it ends: it must not draw a line.
@@ -335,6 +340,12 @@ fn line_layer(layer: &mvt::Layer, extent: i16, mesh: &mut TileMesh) -> Span {
         for part in &feature.parts {
             stroke(part, closed, on_edge, mesh);
         }
+        let code = if use_code {
+            feature.code.unwrap_or(0)
+        } else {
+            0
+        };
+        mesh.line_codes.resize(mesh.line_vertices.len(), code);
     });
     Span {
         start,
@@ -361,10 +372,10 @@ pub fn tessellate(bytes: &[u8]) -> Option<TileMesh> {
     }
     let extent = mesh.extent.min(16384) as i16;
     if let Some(layer) = find("town") {
-        mesh.town_line = line_layer(layer, extent, &mut mesh);
+        mesh.town_line = line_layer(layer, extent, &mut mesh, true);
     }
     if let Some(layer) = find("city") {
-        mesh.city_line = line_layer(layer, extent, &mut mesh);
+        mesh.city_line = line_layer(layer, extent, &mut mesh, false);
     }
     Some(mesh)
 }
@@ -383,6 +394,16 @@ mod tests {
         assert!(mesh.town_line.count >= 24);
         assert_eq!(mesh.line_vertices.len() % 2, 0);
         assert!(mesh.gpu_bytes() > 0);
+    }
+
+    #[test]
+    fn every_town_line_vertex_knows_its_town() {
+        let mesh = tessellate(&mvt::testing::sample_tile()).unwrap();
+        assert_eq!(mesh.line_codes.len(), mesh.line_vertices.len());
+        let span = mesh.town_line;
+        let indices = &mesh.line_indices[span.start as usize..(span.start + span.count) as usize];
+        assert!(!indices.is_empty());
+        assert!(indices.iter().all(|i| mesh.line_codes[*i as usize] == 962));
     }
 
     #[test]

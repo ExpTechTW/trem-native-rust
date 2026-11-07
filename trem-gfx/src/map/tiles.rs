@@ -120,6 +120,9 @@ pub struct VectorGpu {
     pub fill_ib: Option<wgpu::Buffer>,
     pub line_vb: Option<wgpu::Buffer>,
     pub line_ib: Option<wgpu::Buffer>,
+    /// Each line vertex's town code ([`TileMesh::line_codes`]), when the manager keeps
+    /// them.
+    pub line_code_vb: Option<wgpu::Buffer>,
     pub global: Span,
     pub city: Span,
     pub town: Span,
@@ -160,6 +163,8 @@ pub struct TileManager {
     tick: u64,
     vector_url: String,
     terrain_url: Option<String>,
+    /// Upload the line vertices' town codes as well.
+    line_codes: bool,
 }
 
 fn tile_url(template: &str, id: TileId) -> String {
@@ -169,7 +174,7 @@ fn tile_url(template: &str, id: TileId) -> String {
         .replace("{y}", &id.y.to_string())
 }
 
-fn upload_vector(gpu: &Gpu, mesh: &TileMesh) -> VectorGpu {
+fn upload_vector(gpu: &Gpu, mesh: &TileMesh, line_codes: bool) -> VectorGpu {
     let buffer = |label: &str, bytes: &[u8], usage: wgpu::BufferUsages| -> Option<wgpu::Buffer> {
         (!bytes.is_empty()).then(|| {
             gpu.device
@@ -180,7 +185,23 @@ fn upload_vector(gpu: &Gpu, mesh: &TileMesh) -> VectorGpu {
                 })
         })
     };
+    // Codes only beside a full set of vertices: a mesh cut without them has none.
+    let codes = (line_codes && mesh.line_codes.len() == mesh.line_vertices.len())
+        .then(|| {
+            buffer(
+                "tile-line-code",
+                bytemuck::cast_slice(&mesh.line_codes),
+                wgpu::BufferUsages::VERTEX,
+            )
+        })
+        .flatten();
+    let code_bytes = if codes.is_some() {
+        (mesh.line_codes.len() * 4) as u64
+    } else {
+        0
+    };
     VectorGpu {
+        line_code_vb: codes,
         fill_vb: buffer(
             "tile-fill-v",
             bytemuck::cast_slice(&mesh.fill_vertices),
@@ -207,7 +228,7 @@ fn upload_vector(gpu: &Gpu, mesh: &TileMesh) -> VectorGpu {
         town_line: mesh.town_line,
         city_line: mesh.city_line,
         extent: mesh.extent,
-        bytes: mesh.gpu_bytes(),
+        bytes: mesh.gpu_bytes() + code_bytes,
     }
 }
 
@@ -232,7 +253,15 @@ impl TileManager {
                 .terrain_url
                 .filter(|_| cfg!(feature = "dem"))
                 .map(str::to_string),
+            line_codes: false,
         }
+    }
+
+    /// Keep each line vertex's town code on the GPU ([`VectorGpu::line_code_vb`]), for
+    /// [`crate::render::map_pass::MapPass::draw_tile_lines_coded`]. Off by default; set
+    /// it before tiles load, since a tile already up is not uploaded again.
+    pub fn keep_line_codes(&mut self, on: bool) {
+        self.line_codes = on;
     }
 
     pub fn gpu_bytes(&self) -> (u64, u64) {
@@ -301,7 +330,7 @@ impl TileManager {
             any = true;
             match loaded {
                 Loaded::Vector(id, Ok(Some(mesh))) => {
-                    let tile = upload_vector(gpu, &mesh);
+                    let tile = upload_vector(gpu, &mesh, self.line_codes);
                     self.vector_bytes += tile.bytes;
                     self.vector.insert(id, Slot::Ready(tile, self.tick));
                 }

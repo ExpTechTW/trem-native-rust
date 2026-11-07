@@ -18,6 +18,8 @@ use crate::map::tiles::{TileId, TileManager, VectorGpu};
 const WORLD: f64 = 512.0;
 /// One uniform per draw. A frame uses about six per visible tile.
 const MAX_DRAWS: usize = 768;
+/// The town lookup is two squares of this side, one above the other: the fill's colour
+/// by town code, then the towns whose outline is drawn.
 const LOOKUP_SIDE: u32 = 32;
 
 #[repr(C)]
@@ -271,9 +273,11 @@ pub struct MapPass {
     draw_count: usize,
     lookup: wgpu::Texture,
     lookup_pixels: Vec<u8>,
+    outline_pixels: Vec<u8>,
     fill_tile: wgpu::RenderPipeline,
     fill_overlay: wgpu::RenderPipeline,
     line_tile: wgpu::RenderPipeline,
+    line_tile_coded: wgpu::RenderPipeline,
     line_overlay: wgpu::RenderPipeline,
     shade: wgpu::RenderPipeline,
     circle: wgpu::RenderPipeline,
@@ -469,6 +473,17 @@ impl MapPass {
             "fs_fill",
             &[Some(overlay_fill_vb)],
         );
+        let line_code_vb = wgpu::VertexBufferLayout {
+            array_stride: 4,
+            step_mode: wgpu::VertexStepMode::Vertex,
+            attributes: &wgpu::vertex_attr_array![2 => Uint32],
+        };
+        let line_tile_coded = make(
+            "line-tile-coded",
+            "vs_line_tile_coded",
+            "fs_line_coded",
+            &[Some(line_vb.clone()), Some(line_code_vb)],
+        );
         let line_tile = make("line-tile", "vs_line_tile", "fs_line", &[Some(line_vb)]);
         let line_overlay = make(
             "line-overlay",
@@ -524,7 +539,7 @@ impl MapPass {
             label: Some("town-colours"),
             size: wgpu::Extent3d {
                 width: LOOKUP_SIDE,
-                height: LOOKUP_SIDE,
+                height: LOOKUP_SIDE * 2,
                 depth_or_array_layers: 1,
             },
             mip_level_count: 1,
@@ -591,9 +606,11 @@ impl MapPass {
             draw_count: 0,
             lookup,
             lookup_pixels: vec![0; (LOOKUP_SIDE * LOOKUP_SIDE * 4) as usize],
+            outline_pixels: vec![0; (LOOKUP_SIDE * LOOKUP_SIDE * 4) as usize],
             fill_tile,
             fill_overlay,
             line_tile,
+            line_tile_coded,
             line_overlay,
             shade,
             circle,
@@ -626,6 +643,42 @@ impl MapPass {
                 aspect: wgpu::TextureAspect::All,
             },
             &self.lookup_pixels,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(LOOKUP_SIDE * 4),
+                rows_per_image: Some(LOOKUP_SIDE),
+            },
+            wgpu::Extent3d {
+                width: LOOKUP_SIDE,
+                height: LOOKUP_SIDE,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
+
+    /// The towns whose outline [`Self::draw_tile_lines_coded`] draws, by code: the
+    /// lookup's second square. Codes past the lookup are left out.
+    pub fn upload_town_outlines(&mut self, gpu: &Gpu, codes: &[u32]) {
+        self.outline_pixels.fill(0);
+        for code in codes {
+            if *code >= LOOKUP_SIDE * LOOKUP_SIDE {
+                continue;
+            }
+            let at = (*code * 4) as usize;
+            self.outline_pixels[at..at + 4].fill(255);
+        }
+        gpu.queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.lookup,
+                mip_level: 0,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: LOOKUP_SIDE,
+                    z: 0,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            &self.outline_pixels,
             wgpu::TexelCopyBufferLayout {
                 offset: 0,
                 bytes_per_row: Some(LOOKUP_SIDE * 4),
@@ -758,6 +811,43 @@ impl MapPass {
             }
             pass.set_bind_group(1, &self.group1, &[slot]);
             pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
+            pass.draw_indexed(span.start..span.start + span.count, 0, 0..1);
+        }
+    }
+
+    /// A line layer of the vector tiles drawn only on the towns
+    /// [`Self::upload_town_outlines`] chose, as a line layer whose width is a `case` on
+    /// the town's code. Needs the tiles' codes ([`TileManager::keep_line_codes`]); a
+    /// tile without them draws nothing.
+    pub fn draw_tile_lines_coded(
+        &self,
+        pass: &mut wgpu::RenderPass<'_>,
+        tiles: &TileManager,
+        slots: &[TileSlots],
+        pick: fn(&TileSlots) -> Option<u32>,
+        span: fn(&VectorGpu) -> Span,
+    ) {
+        pass.set_pipeline(&self.line_tile_coded);
+        for draws in slots {
+            let Some(tile) = tiles.vector_tile(draws.id) else {
+                continue;
+            };
+            let (Some(vb), Some(codes), Some(ib), Some(slot)) = (
+                &tile.line_vb,
+                &tile.line_code_vb,
+                &tile.line_ib,
+                pick(draws),
+            ) else {
+                continue;
+            };
+            let span = span(tile);
+            if span.count == 0 {
+                continue;
+            }
+            pass.set_bind_group(1, &self.group1, &[slot]);
+            pass.set_vertex_buffer(0, vb.slice(..));
+            pass.set_vertex_buffer(1, codes.slice(..));
             pass.set_index_buffer(ib.slice(..), wgpu::IndexFormat::Uint32);
             pass.draw_indexed(span.start..span.start + span.count, 0, 0..1);
         }
