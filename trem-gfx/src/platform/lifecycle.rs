@@ -2,6 +2,8 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 /// The single-instance lock: a loopback port. A port is what every platform can do
@@ -44,11 +46,67 @@ pub fn serve_instance(
     listener: TcpListener,
     second: impl Fn() + Send + 'static,
 ) {
-    let hello = config.hello;
+    spawn_server(config.hello, listener, None, second);
+}
+
+/// [`serve_instance`] with a way to let go: [`InstanceServer::release`], or dropping it,
+/// closes the port at once. A restart releases it before starting the new process, which
+/// otherwise finds the lock still held by the one leaving, takes itself for a second
+/// launch, and quits.
+pub fn serve_instance_releasable(
+    config: &InstanceConfig,
+    listener: TcpListener,
+    second: impl Fn() + Send + 'static,
+) -> InstanceServer {
+    let port = listener
+        .local_addr()
+        .map(|a| a.port())
+        .unwrap_or(config.port);
+    let stop = Arc::new(AtomicBool::new(false));
+    let thread = spawn_server(config.hello, listener, Some(Arc::clone(&stop)), second);
+    InstanceServer { port, stop, thread }
+}
+
+/// The listener [`serve_instance_releasable`] runs; it holds the lock until released.
+pub struct InstanceServer {
+    port: u16,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl InstanceServer {
+    /// Stop listening and free the port; returns once it is free.
+    pub fn release(self) {
+        drop(self);
+    }
+}
+
+impl Drop for InstanceServer {
+    fn drop(&mut self) {
+        let Some(thread) = self.thread.take() else {
+            return;
+        };
+        self.stop.store(true, Ordering::SeqCst);
+        // The thread waits in accept: a knock of our own wakes it to see the flag.
+        let addr = SocketAddr::from((Ipv4Addr::LOCALHOST, self.port));
+        let _ = TcpStream::connect_timeout(&addr, Duration::from_millis(500));
+        let _ = thread.join();
+    }
+}
+
+fn spawn_server(
+    hello: &'static [u8],
+    listener: TcpListener,
+    stop: Option<Arc<AtomicBool>>,
+    second: impl Fn() + Send + 'static,
+) -> Option<std::thread::JoinHandle<()>> {
     std::thread::Builder::new()
         .name("single-instance".into())
         .spawn(move || {
             for stream in listener.incoming().flatten() {
+                if stop.as_ref().is_some_and(|s| s.load(Ordering::SeqCst)) {
+                    break;
+                }
                 let mut stream = stream;
                 let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
                 let mut knock = vec![0; hello.len()];
@@ -59,7 +117,7 @@ pub fn serve_instance(
             }
         })
         .map_err(|err| log::warn!(target: "app", "單一執行個體的監聽起不來：{err}"))
-        .ok();
+        .ok()
 }
 
 /// The login item: under what name, and what it passes the app.
@@ -189,6 +247,19 @@ pub fn activate_app() {
 #[cfg(not(target_os = "macos"))]
 pub fn activate_app() {}
 
+/// macOS: undo Cmd-H. A hidden app stays hidden whatever its windows are told.
+#[cfg(target_os = "macos")]
+pub fn unhide_app() {
+    use objc2::MainThreadMarker;
+    use objc2_app_kit::NSApplication;
+    if let Some(mtm) = MainThreadMarker::new() {
+        NSApplication::sharedApplication(mtm).unhide(None);
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
+pub fn unhide_app() {}
+
 /// macOS: a window on every Space, also over full-screen apps. PiP's.
 #[cfg(target_os = "macos")]
 pub fn pin_to_all_spaces(window: &winit::window::Window) {
@@ -263,6 +334,33 @@ mod tests {
             hello: b"someone-else!",
         };
         assert!(claim_instance(&theirs).is_none());
+        assert!(heard.try_recv().is_err());
+    }
+
+    #[test]
+    fn a_released_server_frees_the_port_at_once() {
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .and_then(|l| l.local_addr())
+            .expect("a free port")
+            .port();
+        let ours = InstanceConfig {
+            port,
+            hello: b"trem-gfx-release",
+        };
+        let Some(Instance::First(listener)) = claim_instance(&ours) else {
+            panic!("the first launch takes the lock");
+        };
+        let (knocked, heard) = std::sync::mpsc::channel();
+        let server = serve_instance_releasable(&ours, listener, move || {
+            let _ = knocked.send(());
+        });
+        assert!(matches!(claim_instance(&ours), Some(Instance::Second)));
+        heard
+            .recv_timeout(Duration::from_secs(2))
+            .expect("the first launch is told");
+        server.release();
+        // The port is free: the next launch is the first, and nobody was told.
+        assert!(matches!(claim_instance(&ours), Some(Instance::First(_))));
         assert!(heard.try_recv().is_err());
     }
 }
